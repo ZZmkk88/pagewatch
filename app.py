@@ -17,9 +17,8 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+import http.client
+from urllib.parse import urljoin, urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -251,63 +250,141 @@ def _is_blocked_ip(ip) -> bool:
                for net in _BLOCKED_NETWORKS)
 
 
-def _assert_url_allowed(url: str) -> None:
-    """抓取前校验目标不指向内网。本地调试可用环境变量临时放开（默认关）。"""
-    if os.environ.get("PAGEWATCH_ALLOW_PRIVATE_FETCH") == "1":
-        return
-    host = urlparse(url).hostname
+def _checked_ips(host: str) -> list[str]:
+    """解析 host。每条结果都要认得出，且都不能落在内网清单里。"""
     if not host:
         raise FetchError("网址缺少主机名")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise FetchError(f"域名解析失败：{e}") from e
+    ips: list[str] = []
     for info in infos:
+        # 链路本地地址可能带网卡后缀（fe80::1%12），先剥掉再识别。
+        literal = info[4][0].split("%", 1)[0]
         try:
-            ip = ipaddress.ip_address(info[4][0])
+            ip = ipaddress.ip_address(literal)
         except ValueError:
-            continue
+            raise FetchError(f"无法识别的解析结果（{host}）") from None
         if _is_blocked_ip(ip):
             raise FetchError(f"禁止抓取内网地址（{host}）")
+        if literal not in ips:
+            ips.append(literal)
+    if not ips:
+        raise FetchError(f"域名没有可用地址（{host}）")
+    return ips
 
 
-class _GuardedRedirectHandler(HTTPRedirectHandler):
-    """跟随重定向时，每一跳都重新做 SSRF 校验。"""
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """连到校验过的 IP，Host 头仍用原来的主机名。"""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _assert_url_allowed(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+    def __init__(self, host: str, port: int, ip: str, timeout: int) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout
+        )
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """同上。证书校验用原主机名，不改成对 IP 验证书。"""
+
+    def __init__(self, host: str, port: int, ip: str, timeout: int) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _open_connection(scheme: str, host: str, port: int,
+                     ip: str | None, timeout: int):
+    if scheme == "https":
+        if ip is None:
+            return http.client.HTTPSConnection(host, port, timeout=timeout)
+        return _PinnedHTTPSConnection(host, port, ip, timeout)
+    if ip is None:
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+    return _PinnedHTTPConnection(host, port, ip, timeout)
 
 
 def fetch_url(url: str, timeout: int = FETCH_TIMEOUT,
               max_bytes: int = FETCH_MAX_BYTES) -> tuple[int, str]:
-    """抓一个页面，返回 (HTTP 状态码, HTML 文本)。失败抛 FetchError。"""
-    _assert_url_allowed(url)
-    req = Request(url, headers={"User-Agent": "pagewatch/1.0 (text monitor)"})
-    opener = build_opener(_GuardedRedirectHandler())
-    try:
-        with opener.open(req, timeout=timeout) as resp:
+    """抓一个页面，返回 (HTTP 状态码, HTML 文本)。失败抛 FetchError。
+
+    不用 urllib。urllib 会走 HTTP_PROXY，并在真正连接时再解析一次主机名，
+    内网校验就只查了本机看到的地址。这里只连接刚刚校验过的那个 IP，
+    重定向每一跳都重新解析、重新校验。
+    """
+    current = url
+    allow_private = os.environ.get("PAGEWATCH_ALLOW_PRIVATE_FETCH") == "1"
+    for _hop in range(10):
+        parts = urlparse(current)
+        if parts.scheme not in ("http", "https"):
+            raise FetchError(f"不支持的网址协议（{parts.scheme or '空'}）")
+        host = parts.hostname
+        if not host:
+            raise FetchError("网址缺少主机名")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+        ip = None if allow_private else _checked_ips(host)[0]
+        conn = _open_connection(parts.scheme, host, port, ip, timeout)
+        try:
+            try:
+                conn.request(
+                    "GET", path,
+                    headers={"User-Agent": "pagewatch/1.0 (text monitor)"},
+                )
+                resp = conn.getresponse()
+            except (TimeoutError, OSError, http.client.HTTPException) as e:
+                raise FetchError(f"抓取失败：{e}") from e
             status = resp.status
+            if status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                try:
+                    resp.read(1024)
+                except (TimeoutError, OSError):
+                    pass
+                if not location:
+                    raise FetchError(f"HTTP {status}")
+                current = urljoin(current, location)
+                continue
+            if not (200 <= status < 300):
+                raise FetchError(f"HTTP {status}")
             chunks = []
             read = 0
-            while read <= max_bytes:
-                chunk = resp.read(min(65536, max_bytes + 1 - read))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                read += len(chunk)
+            try:
+                while read <= max_bytes:
+                    chunk = resp.read(min(65536, max_bytes + 1 - read))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    read += len(chunk)
+            except (TimeoutError, OSError, http.client.HTTPException) as e:
+                raise FetchError(f"抓取失败：{e}") from e
             raw = b"".join(chunks)
             charset = resp.headers.get_content_charset() or "utf-8"
-    except HTTPError as e:
-        raise FetchError(f"HTTP {e.code}") from e
-    except (URLError, TimeoutError, OSError) as e:
-        raise FetchError(f"抓取失败：{e}") from e
-    if status >= 400:
-        raise FetchError(f"HTTP {status}")
-    try:
-        return status, raw.decode(charset, errors="replace")
-    except (LookupError, UnicodeDecodeError):
-        return status, raw.decode("utf-8", errors="replace")
+            try:
+                text = raw.decode(charset, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                text = raw.decode("utf-8", errors="replace")
+            return status, text
+        finally:
+            conn.close()
+    raise FetchError("重定向次数过多")
 
 
 # ---------------------------------------------------------------- diff
@@ -527,6 +604,23 @@ def change_password(body: ChangePasswordIn,
                 "DELETE FROM tokens WHERE user_id = ? AND token != ?",
                 (user["id"], current_token),
             )
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(authorization: str | None = Header(default=None),
+           user: sqlite3.Row = Depends(current_user)):
+    """退出：吊销当前这枚令牌。其它会话不动。"""
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):]
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录")
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM tokens WHERE token = ? AND user_id = ?",
+            (token, user["id"]),
+        )
     return {"ok": True}
 
 
