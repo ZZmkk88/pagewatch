@@ -139,7 +139,7 @@ async function doLogin(){
     if(d.must_change_password) openPwModal(true);
   }catch(e){ document.getElementById('liErr').textContent=e.message; }
 }
-function logout(){ token=''; localStorage.removeItem('pw_token'); document.getElementById('appView').style.display='none'; document.getElementById('loginView').style.display='flex'; }
+function logout(){ const old=token; token=''; localStorage.removeItem('pw_token'); document.getElementById('appView').style.display='none'; document.getElementById('loginView').style.display='flex'; if(old){ fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+old}}).catch(()=>{}); } }
 function showApp(){ document.getElementById('loginView').style.display='none'; document.getElementById('appView').style.display='block'; refreshAll(); }
 
 /* ---------- 监测项列表 ---------- */
@@ -231,13 +231,13 @@ async function loadNotifs(){
         <div>${esc(n.summary)}</div>
         <div class="nt">${fmtTime(n.created_at)}
           ${n.is_read?'':'<button class="act" style="margin-left:8px" onclick="readOne('+n.id+')">标已读</button>'}
-          <button class="act" style="margin-left:6px" onclick="gotoSnap(${n.watch_id},${n.snapshot_id})">看对比</button></div>
+          ${n.snapshot_id?'<button class="act" style="margin-left:6px" onclick="gotoSnap('+n.watch_id+','+n.snapshot_id+')">看对比</button>':''}</div>
       </div>`).join('') : '<div class="empty">还没有提醒。</div>');
 }
 function toggleNotifs(){ notifOpen=!notifOpen; document.getElementById('notifPanel').style.display=notifOpen?'block':'none'; if(notifOpen) loadNotifs(); }
 async function readOne(id){ await api(`/api/notifications/${id}/read`,{method:'POST'}); await loadNotifs(); }
 async function readAll(){ await api('/api/notifications/read-all',{method:'POST'}); await loadNotifs(); await loadWatches(); }
-async function gotoSnap(wid, sid){ notifOpen=false; document.getElementById('notifPanel').style.display='none'; selectedId=wid; selectedSnapId=sid; await loadWatches(); await loadDetail(wid); const w=watches.find(x=>x.id===wid); if(w&&w.has_unread_change){ await api(`/api/watches/${wid}/seen`,{method:'POST'}); await loadWatches(); await loadNotifs(); } }
+async function gotoSnap(wid, sid){ if(sid==null){ toast('这份快照已超出保留上限'); return; } notifOpen=false; document.getElementById('notifPanel').style.display='none'; selectedId=wid; selectedSnapId=sid; await loadWatches(); await loadDetail(wid); const w=watches.find(x=>x.id===wid); if(w&&w.has_unread_change){ await api(`/api/watches/${wid}/seen`,{method:'POST'}); await loadWatches(); await loadNotifs(); } }
 
 /* ---------- 弹窗：监测项 / 改密码 ---------- */
 function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }

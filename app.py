@@ -231,6 +231,7 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("100.64.0.0/10"),    # CGNAT 共享地址空间
     ipaddress.ip_network("127.0.0.0/8"),      # 回环
     ipaddress.ip_network("169.254.0.0/16"),   # 链路本地（含云元数据地址）
+    ipaddress.ip_network("100.100.100.200/32"),  # 阿里云元数据服务
     ipaddress.ip_network("172.16.0.0/12"),    # RFC1918 私网
     ipaddress.ip_network("192.168.0.0/16"),   # RFC1918 私网
     ipaddress.ip_network("224.0.0.0/4"),       # 组播
@@ -251,13 +252,25 @@ def _is_blocked_ip(ip) -> bool:
                for net in _BLOCKED_NETWORKS)
 
 
+# 云元数据主机名：即使 DNS 被劫持解析到公网段，也按名字直接拦。
+_METADATA_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.google.com",
+})
+
+
 def _assert_url_allowed(url: str) -> None:
     """抓取前校验目标不指向内网。本地调试可用环境变量临时放开（默认关）。"""
     if os.environ.get("PAGEWATCH_ALLOW_PRIVATE_FETCH") == "1":
         return
-    host = urlparse(url).hostname
+    parts = urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        raise FetchError("只允许抓取 http 或 https 网址")
+    host = parts.hostname
     if not host:
         raise FetchError("网址缺少主机名")
+    if host.rstrip(".") in _METADATA_HOSTS:
+        raise FetchError("拒绝访问云元数据地址")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
@@ -373,7 +386,15 @@ def run_check(watch_id: int, fetcher=None) -> dict:
             (watch_id, now, digest, text, is_change),
         )
         snapshot_id = cur.lastrowid
-        # 只保留最近 SNAPSHOT_KEEP 份
+        # 只保留最近 SNAPSHOT_KEEP 份。先把即将删掉的快照从提醒上解开
+        # （提醒行本身保留，未读数不变），再删，避免提醒指向不存在的快照。
+        conn.execute(
+            "UPDATE notifications SET snapshot_id = NULL"
+            " WHERE watch_id = ? AND snapshot_id IS NOT NULL"
+            " AND snapshot_id NOT IN (SELECT id FROM snapshots"
+            " WHERE watch_id = ? ORDER BY id DESC LIMIT ?)",
+            (watch_id, watch_id, SNAPSHOT_KEEP),
+        )
         conn.execute(
             "DELETE FROM snapshots WHERE watch_id = ? AND id NOT IN"
             " (SELECT id FROM snapshots WHERE watch_id = ?"
@@ -526,6 +547,22 @@ def change_password(body: ChangePasswordIn,
             conn.execute(
                 "DELETE FROM tokens WHERE user_id = ? AND token != ?",
                 (user["id"], current_token),
+            )
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(authorization: str | None = Header(default=None),
+           user: sqlite3.Row = Depends(current_user)):
+    """退出登录：只废止当前这次会话的令牌，其他会话不受影响。"""
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+    if token:
+        with get_db() as conn:
+            conn.execute(
+                "DELETE FROM tokens WHERE token = ? AND user_id = ?",
+                (token, user["id"]),
             )
     return {"ok": True}
 
