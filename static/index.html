@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pagewatch · 网页变化监测</title>
+<style>
+  :root{
+    --ink:#20242a; --ink2:#2c313a; --paper:#f4f1ea; --card:#fffdf8;
+    --amber:#e8a13a; --amber-d:#c77f1a; --line:#ddd5c4;
+    --ok:#2e9e5b; --bad:#d64545; --mut:#8a8378; --txt:#2b2620;
+    --add-bg:#e2f4e5; --add-tx:#14532d; --del-bg:#fbe3e3; --del-tx:#7f1d1d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--paper);color:var(--txt)}
+  header{background:var(--ink);color:#f2ead8;display:flex;align-items:center;gap:14px;padding:10px 18px;position:sticky;top:0;z-index:20}
+  .logo{font-size:19px;font-weight:700;letter-spacing:.5px}
+  .logo .dot{color:var(--amber)}
+  .logo small{font-weight:400;color:#b8b2a4;font-size:12px;margin-left:8px}
+  header .sp{flex:1}
+  .hbtn{background:var(--ink2);color:#f2ead8;border:1px solid #454b57;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px}
+  .hbtn:hover{border-color:var(--amber)}
+  .bell{position:relative}
+  .badge{position:absolute;top:-7px;right:-7px;background:var(--bad);color:#fff;border-radius:50%;min-width:19px;height:19px;font-size:11px;display:flex;align-items:center;justify-content:center;padding:0 4px}
+  main{display:flex;gap:16px;padding:16px;max-width:1280px;margin:0 auto;align-items:flex-start}
+  .col-list{width:400px;flex:none;display:flex;flex-direction:column;gap:10px}
+  .col-detail{flex:1;min-width:0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 14px;cursor:pointer;transition:border-color .15s, box-shadow .15s}
+  .card:hover{border-color:var(--amber)}
+  .card.sel{border-color:var(--amber-d);box-shadow:0 0 0 2px #f3d9a8}
+  .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card .url{font-size:12px;color:var(--mut);word-break:break-all}
+  .meta{font-size:12px;color:var(--mut);margin-top:7px;display:flex;gap:12px;flex-wrap:wrap}
+  .sdot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+  .sdot.ok{background:var(--ok)} .sdot.error{background:var(--bad)} .sdot.none{background:#c9c2b2}
+  .tag{font-size:11px;border-radius:20px;padding:1px 8px;font-weight:600}
+  .tag.changed{background:#fbeed3;color:#8a5a00;border:1px solid var(--amber)}
+  .tag.paused{background:#e8e4da;color:#6b6558;border:1px solid var(--line)}
+  .row-btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  button.act{background:#fff;border:1px solid var(--line);border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
+  button.act:hover{border-color:var(--amber-d);color:var(--amber-d)}
+  button.primary{background:var(--amber);border:1px solid var(--amber-d);color:#231a05;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer}
+  button.primary:hover{background:var(--amber-d);color:#fff}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .panel h2{margin:0 0 6px;font-size:17px}
+  .snap{display:flex;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:9px;margin-top:8px;cursor:pointer;background:#fff}
+  .snap:hover{border-color:var(--amber)}
+  .snap.sel{border-color:var(--amber-d);background:#fdf6e3}
+  .snap .t{font-size:13px}
+  .snap .s{font-size:12px;color:var(--mut)}
+  .diff{font-family:Consolas,"Courier New",monospace;font-size:12.5px;line-height:1.55;border:1px solid var(--line);border-radius:9px;overflow:auto;max-height:560px;margin-top:10px;background:#fff}
+  .diff .ln{padding:1px 10px;white-space:pre-wrap;word-break:break-all}
+  .diff .add{background:var(--add-bg);color:var(--add-tx)}
+  .diff .del{background:var(--del-bg);color:var(--del-tx);text-decoration:line-through}
+  .diff .same{color:#57534a}
+  .raw{font-family:Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid var(--line);border-radius:9px;padding:12px;max-height:560px;overflow:auto}
+  .notif-panel{position:absolute;top:52px;right:16px;width:380px;max-height:70vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.25);z-index:30;padding:10px}
+  .notif{border-bottom:1px solid var(--line);padding:9px 6px;font-size:13px}
+  .notif:last-child{border-bottom:none}
+  .notif.unread{background:#fdf6e3}
+  .notif .nt{font-size:12px;color:var(--mut)}
+  .modal-bg{position:fixed;inset:0;background:rgba(20,18,12,.55);display:flex;align-items:center;justify-content:center;z-index:50}
+  .modal{background:var(--card);border-radius:14px;padding:22px;width:420px;max-width:92vw}
+  .modal h3{margin:0 0 14px}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:13px;margin-bottom:5px;color:#57534a}
+  .field input{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;background:#fff}
+  .err{color:var(--bad);font-size:13px;min-height:18px}
+  .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .login-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px;width:360px;max-width:92vw}
+  .login-card h1{margin:0 0 4px;font-size:22px}
+  .login-card p{color:var(--mut);font-size:13px;margin:0 0 18px}
+  .empty{color:var(--mut);font-size:14px;padding:22px;text-align:center}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:#f2ead8;padding:9px 18px;border-radius:9px;font-size:13px;z-index:60;display:none}
+  @media (max-width:900px){ main{flex-direction:column} .col-list{width:100%} }
+</style>
+</head>
+<body>
+
+<div id="loginView" class="login-wrap" style="display:none">
+  <div class="login-card">
+    <h1>pagewatch <span style="color:var(--amber-d)">●</span></h1>
+    <p>网页变化监测 · 登录后开始盯梢</p>
+    <div class="field"><label>用户名</label><input id="liUser" value="admin"></div>
+    <div class="field"><label>密码</label><input id="liPass" type="password"></div>
+    <div class="err" id="liErr"></div>
+    <button class="primary" style="width:100%" onclick="doLogin()">登录</button>
+  </div>
+</div>
+
+<div id="appView" style="display:none">
+  <header>
+    <div class="logo">pagewatch<span class="dot">●</span><small>网页变化监测</small></div>
+    <div class="sp"></div>
+    <button class="hbtn bell" onclick="toggleNotifs()">提醒<span id="bellBadge" class="badge" style="display:none">0</span></button>
+    <button class="hbtn" onclick="openPwModal()">改密码</button>
+    <button class="hbtn" onclick="logout()">退出</button>
+    <div id="notifPanel" class="notif-panel" style="display:none"></div>
+  </header>
+  <main>
+    <div class="col-list">
+      <button class="primary" onclick="openWatchModal()">＋ 新建监测项</button>
+      <div id="watchList"></div>
+    </div>
+    <div class="col-detail">
+      <div class="panel" id="detailPanel"><div class="empty">从左侧选一个监测项，看它的快照和变化对比。</div></div>
+    </div>
+  </main>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toast" class="toast"></div>
+
+<script>
+let token = localStorage.getItem('pw_token') || '';
+let watches = [], selectedId = null, selectedSnapId = null, notifOpen = false;
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',2600); }
+async function api(path, opts={}){
+  const r = await fetch(path, { ...opts, headers:{ 'Content-Type':'application/json', ...(token?{'Authorization':'Bearer '+token}:{}) } });
+  if(r.status===401 && path!=='/api/login'){ logout(); throw new Error('登录已过期'); }
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.detail || ('请求失败 '+r.status));
+  return data;
+}
+function fmtTime(s){ if(!s) return '—'; const d=new Date(s); return d.toLocaleString('zh-CN',{hour12:false}); }
+
+/* ---------- 登录 ---------- */
+async function doLogin(){
+  const u=document.getElementById('liUser').value.trim(), p=document.getElementById('liPass').value;
+  document.getElementById('liErr').textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.detail||'登录失败');
+    token=d.token; localStorage.setItem('pw_token',token);
+    showApp();
+    if(d.must_change_password) openPwModal(true);
+  }catch(e){ document.getElementById('liErr').textContent=e.message; }
+}
+function logout(){ token=''; localStorage.removeItem('pw_token'); document.getElementById('appView').style.display='none'; document.getElementById('loginView').style.display='flex'; }
+function showApp(){ document.getElementById('loginView').style.display='none'; document.getElementById('appView').style.display='block'; refreshAll(); }
+
+/* ---------- 监测项列表 ---------- */
+async function refreshAll(){ await loadWatches(); await loadNotifs(); if(selectedId) await loadDetail(selectedId); }
+async function loadWatches(){
+  watches = await api('/api/watches');
+  const el = document.getElementById('watchList');
+  if(!watches.length){ el.innerHTML='<div class="empty">还没有监测项，点上面按钮建一个。</div>'; return; }
+  el.innerHTML = watches.map(w=>`
+    <div class="card ${w.id===selectedId?'sel':''}" onclick="selectWatch(${w.id})">
+      <h3><span class="sdot ${w.last_status||'none'}"></span>${esc(w.name)}
+        ${w.has_unread_change?'<span class="tag changed">有变化</span>':''}
+        ${w.paused?'<span class="tag paused">已暂停</span>':''}</h3>
+      <div class="url">${esc(w.url)}</div>
+      <div class="meta"><span>每 ${w.interval_minutes} 分钟查一次</span><span>快照 ${w.snapshot_count} 份</span></div>
+      <div class="meta"><span>上次检查：${fmtTime(w.last_checked_at)}</span>${w.last_status==='error'?`<span style="color:var(--bad)">${esc(w.last_error)}</span>`:''}</div>
+      <div class="row-btns">
+        <button class="act" onclick="event.stopPropagation();doCheck(${w.id})">立即检查</button>
+        ${w.paused?`<button class="act" onclick="event.stopPropagation();doResume(${w.id})">恢复</button>`:`<button class="act" onclick="event.stopPropagation();doPause(${w.id})">暂停</button>`}
+        <button class="act" onclick="event.stopPropagation();openWatchModal(${w.id})">编辑</button>
+        <button class="act" onclick="event.stopPropagation();doDelete(${w.id})">删除</button>
+      </div>
+    </div>`).join('');
+}
+async function selectWatch(id){
+  selectedId=id; selectedSnapId=null;
+  const w=watches.find(x=>x.id===id);
+  await loadWatches(); await loadDetail(id);
+  if(w && w.has_unread_change){ await api(`/api/watches/${id}/seen`,{method:'POST'}); await loadWatches(); await loadNotifs(); }
+}
+async function doCheck(id){ toast('检查中…'); try{ const r=await api(`/api/watches/${id}/check`,{method:'POST'}); toast(r.status==='error'?('检查失败：'+r.error):(r.is_change?'检查完成：发现变化！':'检查完成：没有变化')); }catch(e){ toast(e.message); } await refreshAll(); }
+async function doPause(id){ await api(`/api/watches/${id}/pause`,{method:'POST'}); await loadWatches(); }
+async function doResume(id){ await api(`/api/watches/${id}/resume`,{method:'POST'}); await loadWatches(); }
+async function doDelete(id){ if(!confirm('确定删除这个监测项？它的快照和提醒会一并删掉。')) return; await api(`/api/watches/${id}`,{method:'DELETE'}); if(selectedId===id){selectedId=null;document.getElementById('detailPanel').innerHTML='<div class="empty">从左侧选一个监测项。</div>';} await loadWatches(); await loadNotifs(); }
+
+/* ---------- 详情：快照 + diff ---------- */
+async function loadDetail(id){
+  const w = watches.find(x=>x.id===id); if(!w) return;
+  const snaps = await api(`/api/watches/${id}/snapshots`);
+  const panel = document.getElementById('detailPanel');
+  if(!selectedSnapId && snaps.length) selectedSnapId = snaps[0].id;
+  panel.innerHTML = `
+    <h2>${esc(w.name)}</h2>
+    <div class="url" style="font-size:13px;color:var(--mut);word-break:break-all">${esc(w.url)}</div>
+    <div class="meta" style="display:flex;gap:12px;font-size:12px;color:var(--mut);margin-top:6px;flex-wrap:wrap">
+      <span>间隔 ${w.interval_minutes} 分钟</span><span>上次检查 ${fmtTime(w.last_checked_at)}</span>
+      <span>状态 ${w.last_status||'未检查'}</span>${w.last_changed_at?`<span>上次变化 ${fmtTime(w.last_changed_at)}</span>`:''}
+    </div>
+    <h3 style="margin:16px 0 4px;font-size:14px">快照历史（点一份看它与上一份的对比）</h3>
+    <div id="snapList">${snaps.length? '' : '<div class="empty">还没有快照，点「立即检查」抓第一份。</div>'}</div>
+    <div id="diffBox"></div>`;
+  document.getElementById('snapList').innerHTML = snaps.map(s=>`
+    <div class="snap ${s.id===selectedSnapId?'sel':''}" onclick="showDiff(${id},${s.id})">
+      <span class="t">${fmtTime(s.created_at)}</span>
+      ${s.is_change?'<span class="tag changed">有变化</span>':'<span class="s">无变化</span>'}
+      <span class="s">${s.text_len} 字</span>
+    </div>`).join('');
+  if(selectedSnapId) await showDiff(id, selectedSnapId, true);
+}
+async function showDiff(wid, sid, keep){
+  selectedSnapId = sid;
+  if(!keep){ document.querySelectorAll('.snap').forEach(n=>n.classList.remove('sel')); }
+  const diff = await api(`/api/watches/${wid}/diff/${sid}`);
+  const box = document.getElementById('diffBox'); if(!box) return;
+  const head = diff.is_first ? '这是第一份快照，全文如下（绿色为全文）' : `与上一份对比：新增 ${diff.added} 行，删除 ${diff.removed} 行${diff.changed?'':'，内容没有变化'}`;
+  box.innerHTML = `<div style="margin-top:14px;font-size:13px;color:#57534a">${head}
+      <button class="act" style="margin-left:10px" onclick="showRaw(${wid},${sid})">看快照原文</button></div>
+    <div class="diff">${diff.rows.map(r=>`<div class="ln ${r.type}">${r.type==='add'?'+ ':r.type==='del'?'− ':'  '}${esc(r.text)}</div>`).join('')}</div>`;
+}
+async function showRaw(wid, sid){
+  const s = await api(`/api/watches/${wid}/snapshots/${sid}`);
+  const box = document.getElementById('diffBox');
+  box.innerHTML = `<div style="margin-top:14px;font-size:13px;color:#57534a">快照原文（${fmtTime(s.created_at)}）
+      <button class="act" style="margin-left:10px" onclick="showDiff(${wid},${sid})">回到对比</button></div>
+    <div class="raw">${esc(s.text)}</div>`;
+}
+
+/* ---------- 提醒 ---------- */
+async function loadNotifs(){
+  const d = await api('/api/notifications');
+  const badge = document.getElementById('bellBadge');
+  badge.style.display = d.unread? 'flex':'none'; badge.textContent = d.unread;
+  const panel = document.getElementById('notifPanel');
+  panel.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 6px">
+      <b>变化提醒</b><button class="act" onclick="readAll()">全部标已读</button></div>` +
+    (d.items.length? d.items.map(n=>`
+      <div class="notif ${n.is_read?'':'unread'}">
+        <div><b>${esc(n.watch_name)}</b> 有变化</div>
+        <div>${esc(n.summary)}</div>
+        <div class="nt">${fmtTime(n.created_at)}
+          ${n.is_read?'':'<button class="act" style="margin-left:8px" onclick="readOne('+n.id+')">标已读</button>'}
+          <button class="act" style="margin-left:6px" onclick="gotoSnap(${n.watch_id},${n.snapshot_id})">看对比</button></div>
+      </div>`).join('') : '<div class="empty">还没有提醒。</div>');
+}
+function toggleNotifs(){ notifOpen=!notifOpen; document.getElementById('notifPanel').style.display=notifOpen?'block':'none'; if(notifOpen) loadNotifs(); }
+async function readOne(id){ await api(`/api/notifications/${id}/read`,{method:'POST'}); await loadNotifs(); }
+async function readAll(){ await api('/api/notifications/read-all',{method:'POST'}); await loadNotifs(); await loadWatches(); }
+async function gotoSnap(wid, sid){ notifOpen=false; document.getElementById('notifPanel').style.display='none'; selectedId=wid; selectedSnapId=sid; await loadWatches(); await loadDetail(wid); const w=watches.find(x=>x.id===wid); if(w&&w.has_unread_change){ await api(`/api/watches/${wid}/seen`,{method:'POST'}); await loadWatches(); await loadNotifs(); } }
+
+/* ---------- 弹窗：监测项 / 改密码 ---------- */
+function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+function openWatchModal(id){
+  const w = id? watches.find(x=>x.id===id) : null;
+  document.getElementById('modalRoot').innerHTML = `
+  <div class="modal-bg"><div class="modal">
+    <h3>${w?'编辑监测项':'新建监测项'}</h3>
+    <div class="field"><label>名称</label><input id="wName" value="${w?esc(w.name):''}" placeholder="如：某产品价格页"></div>
+    <div class="field"><label>网址（http/https）</label><input id="wUrl" value="${w?esc(w.url):''}" placeholder="https://example.com/page"></div>
+    <div class="field"><label>检查间隔（分钟）</label><input id="wInt" type="number" min="1" max="10080" value="${w?w.interval_minutes:60}"></div>
+    <div class="err" id="wErr"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="act" onclick="closeModal()">取消</button>
+      <button class="primary" onclick="saveWatch(${w?w.id:'null'})">保存</button>
+    </div></div></div>`;
+}
+async function saveWatch(id){
+  const body={ name:document.getElementById('wName').value, url:document.getElementById('wUrl').value, interval_minutes:parseInt(document.getElementById('wInt').value||'60',10) };
+  try{
+    if(id) await api(`/api/watches/${id}`,{method:'PUT',body:JSON.stringify(body)});
+    else { const w=await api('/api/watches',{method:'POST',body:JSON.stringify(body)}); selectedId=w.id; }
+    closeModal(); await refreshAll();
+  }catch(e){ document.getElementById('wErr').textContent=e.message; }
+}
+function openPwModal(first){
+  document.getElementById('modalRoot').innerHTML = `
+  <div class="modal-bg"><div class="modal">
+    <h3>${first?'首次登录，请修改默认密码':'修改密码'}</h3>
+    ${first?'<p style="font-size:13px;color:var(--mut)">默认密码是公开的演示约定（admin123），建议现在就改掉；也可以稍后再改。</p>':''}
+    <div class="field"><label>原密码</label><input id="pwOld" type="password"></div>
+    <div class="field"><label>新密码（至少 6 位）</label><input id="pwNew" type="password"></div>
+    <div class="err" id="pwErr"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="act" onclick="closeModal()">${first?'稍后再说':'取消'}</button>
+      <button class="primary" onclick="savePw()">保存</button>
+    </div></div></div>`;
+}
+async function savePw(){
+  try{
+    await api('/api/change-password',{method:'POST',body:JSON.stringify({old_password:document.getElementById('pwOld').value,new_password:document.getElementById('pwNew').value})});
+    closeModal(); toast('密码已修改');
+  }catch(e){ document.getElementById('pwErr').textContent=e.message; }
+}
+
+/* ---------- 启动 ---------- */
+if(token){ showApp(); } else { document.getElementById('loginView').style.display='flex'; }
+setInterval(()=>{ if(token && !document.hidden) loadNotifs().catch(()=>{}); }, 30000);
+</script>
+</body>
+</html>
