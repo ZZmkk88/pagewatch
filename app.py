@@ -49,11 +49,38 @@ def iso(dt: datetime) -> str:
 # ---------------------------------------------------------------- 数据库
 
 
-def get_db() -> sqlite3.Connection:
+class _ClosingConn:
+    """包装 sqlite3 连接：with 结束时先提交/回滚再关闭连接。
+
+    sqlite3 自带的 with 只管提交不管关闭，连接不关掉，在 Windows 上会一直
+    占用 db 文件，导致删库/迁移时报 PermissionError。调用方式不变：
+    `with get_db() as conn`。
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def get_db() -> _ClosingConn:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return _ClosingConn(conn)
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -413,16 +440,25 @@ def me(user: sqlite3.Row = Depends(current_user)):
 
 @app.post("/api/change-password")
 def change_password(body: ChangePasswordIn,
+                    authorization: str | None = Header(default=None),
                     user: sqlite3.Row = Depends(current_user)):
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
     if not verify_password(body.old_password, user["password_hash"]):
         raise HTTPException(status_code=400, detail="原密码不正确")
+    # 保留本次登录的令牌，吊销该用户的其他会话（与首次改密提示口径不冲突）
+    current_token = ""
+    if authorization and authorization.startswith("Bearer "):
+        current_token = authorization[len("Bearer "):]
     with get_db() as conn:
         conn.execute(
             "UPDATE users SET password_hash = ?, must_change_password = 0"
             " WHERE id = ?",
             (hash_password(body.new_password), user["id"]),
+        )
+        conn.execute(
+            "DELETE FROM tokens WHERE user_id = ? AND token != ?",
+            (user["id"], current_token),
         )
     return {"ok": True}
 
