@@ -5,6 +5,7 @@
 """
 
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -462,6 +463,201 @@ def test_ssrf_blocks_metadata_host_and_scheme():
     with pytest.raises(app_module.FetchError) as exc2:
         app_module.fetch_url("http://100.100.100.200/latest/meta-data/")
     assert "内网" in str(exc2.value)
+
+
+def _public_dns(monkeypatch):
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+
+
+def test_pinned_connection_uses_validated_ip(monkeypatch):
+    """TASK-034：DNS rebind 防护——连接只打向校验过的 IP，不在连接时重解析。"""
+    calls = {"dns": 0}
+    connected = {}
+
+    def fake_getaddrinfo(host, port, *a, **k):
+        calls["dns"] += 1
+        if calls["dns"] == 1:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     ("93.184.216.34", 0))]
+        # 攻击者的 DNS 在连接时把域名指回本机（rebind）
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+    def fake_create_connection(address, timeout=None, *a, **k):
+        connected["addr"] = address
+        raise OSError("probe-blocked")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    with pytest.raises(app_module.FetchError):
+        app_module.fetch_url("http://rebind.example/")
+    # 连接打向第一次校验过的公网 IP，而不是 rebind 后的 127.0.0.1
+    assert connected["addr"][0] == "93.184.216.34"
+
+
+def test_redirect_hop_revalidated(monkeypatch):
+    """TASK-034：重定向每一跳重新解析校验，跳到内网即拒绝。"""
+    def fake_getaddrinfo(host, port, *a, **k):
+        ip = "169.254.169.254" if host == "evil.example" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+    class FakeResp:
+        status = 302
+
+        def getheader(self, name):
+            return "http://evil.example/secret" if name == "Location" else None
+
+        def read(self, n=-1):
+            return b""
+
+    class FakeConn:
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            return FakeResp()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(app_module, "_open_connection",
+                        lambda *a, **k: FakeConn())
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://start.example/")
+    assert "内网" in str(exc.value)
+
+
+def test_redirect_hop_limit(monkeypatch):
+    """TASK-034：重定向超过 10 跳拒绝。"""
+    _public_dns(monkeypatch)
+
+    class FakeResp:
+        status = 302
+
+        def getheader(self, name):
+            return "/loop" if name == "Location" else None
+
+        def read(self, n=-1):
+            return b""
+
+    class FakeConn:
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            return FakeResp()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "_open_connection",
+                        lambda *a, **k: FakeConn())
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://loopy.example/")
+    assert "重定向次数过多" in str(exc.value)
+
+
+def test_unparseable_dns_result_rejected(monkeypatch):
+    """TASK-034：解析结果无法识别时拒绝，不再静默放行。"""
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", 0))],
+    )
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://weird.example/")
+    assert "无法识别" in str(exc.value)
+
+
+def _fake_conn_with_body(body: bytes, content_type):
+    class FakeHeaders:
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get(self, name, default=None):
+            return content_type if name == "Content-Type" else default
+
+    class FakeResp:
+        status = 200
+        headers = FakeHeaders()
+
+        def __init__(self):
+            self._buf = body
+
+        def read(self, n=-1):
+            chunk, self._buf = self._buf[:n], self._buf[n:]
+            return chunk
+
+    class FakeConn:
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            return FakeResp()
+
+        def close(self):
+            pass
+
+    return FakeConn()
+
+
+def test_oversize_page_rejected(monkeypatch):
+    """TASK-049 P2-1：页面超过体积上限抛错，不存截断快照。"""
+    _public_dns(monkeypatch)
+    conn = _fake_conn_with_body(b"x" * 150, "text/html; charset=utf-8")
+    monkeypatch.setattr(app_module, "_open_connection",
+                        lambda *a, **k: conn)
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://big.example/", max_bytes=100)
+    assert "体积上限" in str(exc.value)
+    # 恰好等于上限的仍成功
+    conn2 = _fake_conn_with_body(b"x" * 150, "text/html; charset=utf-8")
+    monkeypatch.setattr(app_module, "_open_connection",
+                        lambda *a, **k: conn2)
+    status, text = app_module.fetch_url("http://big.example/", max_bytes=150)
+    assert status == 200 and len(text) == 150
+
+
+def test_non_html_rejected(monkeypatch):
+    """TASK-049 P2-3：非 text/html 响应拒绝，与 README 对齐。"""
+    _public_dns(monkeypatch)
+    for ct, frag in [("text/plain", "text/plain"),
+                     (None, "Content-Type"),
+                     ("application/xhtml+xml", "application/xhtml+xml")]:
+        conn = _fake_conn_with_body(b"hello", ct)
+        monkeypatch.setattr(app_module, "_open_connection",
+                            lambda *a, **k: conn)
+        with pytest.raises(app_module.FetchError) as exc:
+            app_module.fetch_url("http://x.example/")
+        assert frag in str(exc.value)
+
+
+def test_read_one_clears_watch_flag_when_no_unread_left(monkeypatch):
+    """TASK-049 P2-4：单条标已读后该监测项无未读则清 has_unread_change。"""
+    h = login()
+    w = make_watch(h)
+    site = FakeSite(PAGE_V1)
+    monkeypatch.setattr(app_module, "fetch_url", site)
+    client.post(f"/api/watches/{w['id']}/check", headers=h)
+    site.html = PAGE_V2
+    client.post(f"/api/watches/{w['id']}/check", headers=h)
+    site.html = PAGE_V1
+    client.post(f"/api/watches/{w['id']}/check", headers=h)
+    notifs = client.get("/api/notifications", headers=h).json()
+    assert notifs["unread"] == 2
+    ids = [n["id"] for n in notifs["items"]]
+    assert client.post("/api/notifications/999999/read",
+                       headers=h).status_code == 404
+    client.post(f"/api/notifications/{ids[0]}/read", headers=h)
+    watch = client.get("/api/watches", headers=h).json()[0]
+    assert watch["has_unread_change"] is True  # 还剩一条未读，标记保留
+    client.post(f"/api/notifications/{ids[1]}/read", headers=h)
+    watch = client.get("/api/watches", headers=h).json()[0]
+    assert watch["has_unread_change"] is False  # 无未读了，标记清除
 
 
 # ------------------------------------------------------------------ 真抓取（本地服务）
