@@ -6,9 +6,11 @@
 
 import difflib
 import hashlib
+import ipaddress
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -16,7 +18,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -190,12 +193,132 @@ class FetchError(Exception):
     pass
 
 
+# 云元数据与链路本地。用户显式填写的环回/私网地址仍允许直接抓取
+# （本机测试和自托管监测内网页面都依赖这一点）。
+_METADATA_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.google.com",
+})
+_METADATA_IPS = frozenset({
+    ipaddress.ip_address("169.254.169.254"),
+    ipaddress.ip_address("100.100.100.200"),
+})
+
+
+def _hostname_of(url: str) -> str:
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+    return host.lower().rstrip(".")
+
+
+def _effective_port(url: str) -> int:
+    parts = urlparse(url)
+    if parts.port:
+        return parts.port
+    return 443 if parts.scheme == "https" else 80
+
+
+def _as_ip(host: str):
+    text = host.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def _unwrap_ip(ip):
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped if mapped is not None else ip
+
+
+def _resolved_ips(host: str) -> list:
+    literal = _as_ip(host)
+    if literal is not None:
+        return [literal]
+    found = []
+    seen = set()
+    for info in socket.getaddrinfo(host, None):
+        addr = info[4][0].split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.compressed not in seen:
+            seen.add(ip.compressed)
+            found.append(ip)
+    return found
+
+
+def _is_metadata_ip(ip) -> bool:
+    ip = _unwrap_ip(ip)
+    return ip in _METADATA_IPS or bool(ip.is_link_local)
+
+
+def _is_non_global(ip) -> bool:
+    ip = _unwrap_ip(ip)
+    return (not ip.is_global) or bool(ip.is_multicast)
+
+
+def _reject_initial_target(url: str) -> None:
+    """初始网址：拒绝链路本地和云元数据，放行用户写明的环回/私网。"""
+    parts = urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        raise FetchError("只允许抓取 http 或 https")
+    host = _hostname_of(url)
+    if not host:
+        raise FetchError("网址缺少主机名")
+    if host in _METADATA_HOSTS:
+        raise FetchError("拒绝访问云元数据地址")
+    literal = _as_ip(host)
+    if literal is not None:
+        if _is_metadata_ip(literal):
+            raise FetchError("拒绝访问链路本地或云元数据地址")
+        return
+    try:
+        ips = _resolved_ips(host)
+    except socket.gaierror:
+        return
+    if any(_is_metadata_ip(ip) for ip in ips):
+        raise FetchError("拒绝访问链路本地或云元数据地址")
+
+
+class _GuardRedirect(HTTPRedirectHandler):
+    """只跟随 http/https。非公网目标仅限同一主机、同一端口，且不能是元数据地址。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parts = urlparse(newurl)
+        if parts.scheme not in ("http", "https"):
+            raise FetchError("拒绝重定向到非 http(s)")
+        host = _hostname_of(newurl)
+        if not host or host in _METADATA_HOSTS:
+            raise FetchError("拒绝重定向到该主机")
+        try:
+            ips = _resolved_ips(host)
+        except socket.gaierror as exc:
+            raise FetchError(f"重定向目标无法解析：{exc}") from exc
+        if not ips or any(_is_metadata_ip(ip) for ip in ips):
+            raise FetchError("拒绝重定向到链路本地或云元数据地址")
+        if any(_is_non_global(ip) for ip in ips):
+            same = (
+                host == _hostname_of(req.full_url)
+                and _effective_port(newurl) == _effective_port(req.full_url)
+            )
+            if not same:
+                raise FetchError("拒绝重定向到其他内网或本机地址")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch_url(url: str, timeout: int = FETCH_TIMEOUT,
               max_bytes: int = FETCH_MAX_BYTES) -> tuple[int, str]:
     """抓一个页面，返回 (HTTP 状态码, HTML 文本)。失败抛 FetchError。"""
+    _reject_initial_target(url)
     req = Request(url, headers={"User-Agent": "pagewatch/1.0 (text monitor)"})
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with build_opener(_GuardRedirect).open(req, timeout=timeout) as resp:
             status = resp.status
             chunks = []
             read = 0
@@ -282,7 +405,16 @@ def run_check(watch_id: int, fetcher=None) -> dict:
             (watch_id, now, digest, text, is_change),
         )
         snapshot_id = cur.lastrowid
-        # 只保留最近 SNAPSHOT_KEEP 份
+        # 只保留最近 SNAPSHOT_KEEP 份。先把即将删掉的快照从提醒上解开，
+        # 提醒行本身保留（未读计数不能因为轮转变少）。
+        conn.execute(
+            "UPDATE notifications SET snapshot_id = NULL WHERE watch_id = ?"
+            " AND snapshot_id IN ("
+            "  SELECT id FROM snapshots WHERE watch_id = ? AND id NOT IN ("
+            "   SELECT id FROM snapshots WHERE watch_id = ?"
+            "   ORDER BY id DESC LIMIT ?))",
+            (watch_id, watch_id, watch_id, SNAPSHOT_KEEP),
+        )
         conn.execute(
             "DELETE FROM snapshots WHERE watch_id = ? AND id NOT IN"
             " (SELECT id FROM snapshots WHERE watch_id = ?"
@@ -423,6 +555,21 @@ def change_password(body: ChangePasswordIn,
             "UPDATE users SET password_hash = ?, must_change_password = 0"
             " WHERE id = ?",
             (hash_password(body.new_password), user["id"]),
+        )
+        conn.execute("DELETE FROM tokens WHERE user_id = ?", (user["id"],))
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(authorization: str | None = Header(default=None),
+           user: sqlite3.Row = Depends(current_user)):
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM tokens WHERE token = ? AND user_id = ?",
+            (token, user["id"]),
         )
     return {"ok": True}
 
