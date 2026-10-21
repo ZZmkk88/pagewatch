@@ -6,9 +6,11 @@
 
 import difflib
 import hashlib
+import ipaddress
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -16,7 +18,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -217,12 +220,73 @@ class FetchError(Exception):
     pass
 
 
+# SSRF 防护（口径总表第 9 条）：抓用户给的网址之前，先把主机名解析出的每个
+# 地址都对一遍显式内网清单，命中即拒绝；重定向的每一跳同样重新校验。
+# 注意不含 198.18.0.0/15：运行环境的 DNS 是假 IP 模式，公网域名会解析到
+# 198.18 段，用 ipaddress.is_private 一刀切会把正常网站全拦掉（实测教训），
+# 所以这里只拦下面列出的明确内网/保留网段。
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),        # 本网络/未指定
+    ipaddress.ip_network("10.0.0.0/8"),       # RFC1918 私网
+    ipaddress.ip_network("100.64.0.0/10"),    # CGNAT 共享地址空间
+    ipaddress.ip_network("127.0.0.0/8"),      # 回环
+    ipaddress.ip_network("169.254.0.0/16"),   # 链路本地（含云元数据地址）
+    ipaddress.ip_network("172.16.0.0/12"),    # RFC1918 私网
+    ipaddress.ip_network("192.168.0.0/16"),   # RFC1918 私网
+    ipaddress.ip_network("224.0.0.0/4"),       # 组播
+    ipaddress.ip_network("240.0.0.0/4"),      # 保留段
+    ipaddress.ip_network("::/128"),           # IPv6 未指定
+    ipaddress.ip_network("::1/128"),          # IPv6 回环
+    ipaddress.ip_network("fc00::/7"),         # IPv6 唯一本地地址
+    ipaddress.ip_network("fe80::/10"),        # IPv6 链路本地
+    ipaddress.ip_network("ff00::/8"),         # IPv6 组播
+]
+
+
+def _is_blocked_ip(ip) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)  # ::ffff:1.2.3.4 这类 v4 映射地址
+    if mapped is not None:
+        ip = mapped
+    return any(ip.version == net.version and ip in net
+               for net in _BLOCKED_NETWORKS)
+
+
+def _assert_url_allowed(url: str) -> None:
+    """抓取前校验目标不指向内网。本地调试可用环境变量临时放开（默认关）。"""
+    if os.environ.get("PAGEWATCH_ALLOW_PRIVATE_FETCH") == "1":
+        return
+    host = urlparse(url).hostname
+    if not host:
+        raise FetchError("网址缺少主机名")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise FetchError(f"域名解析失败：{e}") from e
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise FetchError(f"禁止抓取内网地址（{host}）")
+
+
+class _GuardedRedirectHandler(HTTPRedirectHandler):
+    """跟随重定向时，每一跳都重新做 SSRF 校验。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_url_allowed(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch_url(url: str, timeout: int = FETCH_TIMEOUT,
               max_bytes: int = FETCH_MAX_BYTES) -> tuple[int, str]:
     """抓一个页面，返回 (HTTP 状态码, HTML 文本)。失败抛 FetchError。"""
+    _assert_url_allowed(url)
     req = Request(url, headers={"User-Agent": "pagewatch/1.0 (text monitor)"})
+    opener = build_opener(_GuardedRedirectHandler())
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             chunks = []
             read = 0
@@ -379,7 +443,9 @@ async def lifespan(app: FastAPI):
     _scheduler_stop.set()
 
 
-app = FastAPI(title="pagewatch", lifespan=lifespan)
+# 口径总表第 6 条：接口文档页默认关闭（未登录可访问视为问题）
+app = FastAPI(title="pagewatch", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 
 # ---------------------------------------------------------------- 鉴权
@@ -456,10 +522,11 @@ def change_password(body: ChangePasswordIn,
             " WHERE id = ?",
             (hash_password(body.new_password), user["id"]),
         )
-        conn.execute(
-            "DELETE FROM tokens WHERE user_id = ? AND token != ?",
-            (user["id"], current_token),
-        )
+        if current_token:  # 取不到当前令牌时不删，避免把自己踢下线
+            conn.execute(
+                "DELETE FROM tokens WHERE user_id = ? AND token != ?",
+                (user["id"], current_token),
+            )
     return {"ok": True}
 
 
@@ -474,10 +541,18 @@ class WatchIn(BaseModel):
 
 def _validate_watch(body: WatchIn) -> tuple[str, str, int]:
     name = body.name.strip()
-    if not name or len(name) > 100:
-        raise HTTPException(status_code=400, detail="名称必填且不超过 100 字")
+    if not name:
+        raise HTTPException(status_code=400, detail="名称必填")
+    if len(name) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"名称不能超过 100 字（当前 {len(name)} 字）")
     url = body.url.strip()
-    if len(url) > 2000 or not (url.startswith("http://") or url.startswith("https://")):
+    if len(url) > 2000:
+        raise HTTPException(
+            status_code=400,
+            detail=f"网址不能超过 2000 字（当前 {len(url)} 字）")
+    if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="网址必须以 http:// 或 https:// 开头")
     if not (1 <= body.interval_minutes <= 10080):
         raise HTTPException(status_code=400, detail="检查间隔需在 1 到 10080 分钟之间")
