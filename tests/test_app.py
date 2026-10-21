@@ -403,6 +403,67 @@ def test_overlong_input_rejected_with_lengths():
     assert "2000" in r.json()["detail"]
 
 
+def test_logout_revokes_only_current_session():
+    """TASK-021 P1-3：退出登录只废止当前这次会话，其他会话保留。"""
+    h1 = login()
+    h2 = login()
+    r = client.post("/api/logout", headers=h1)
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert client.get("/api/me", headers=h1).status_code == 401  # 当前会话已废止
+    assert client.get("/api/me", headers=h2).status_code == 200  # 其他会话保留
+    # 已作废的令牌再调退出接口也返回 401
+    assert client.post("/api/logout", headers=h1).status_code == 401
+
+
+def test_snapshot_rotation_unlinks_notifications():
+    """TASK-021 P1-4：轮转删旧快照前先解开提醒，无悬空指向，提醒数不变。"""
+    h = login()
+    w = make_watch(h)
+    counter = {"n": 0}
+
+    def changing(url):
+        counter["n"] += 1
+        return 200, f"<html><body><p>第 {counter['n']} 版内容</p></body></html>"
+
+    for _ in range(25):
+        result = app_module.run_check(w["id"], fetcher=changing)
+        assert result["status"] == "ok"
+    with app_module.get_db() as conn:
+        dangling = conn.execute(
+            "SELECT COUNT(*) FROM notifications n LEFT JOIN snapshots s"
+            " ON n.snapshot_id = s.id"
+            " WHERE n.snapshot_id IS NOT NULL AND s.id IS NULL"
+        ).fetchone()[0]
+        nulled = conn.execute(
+            "SELECT COUNT(*) FROM notifications"
+            " WHERE watch_id = ? AND snapshot_id IS NULL",
+            (w["id"],),
+        ).fetchone()[0]
+    assert dangling == 0
+    assert nulled == 4  # 被轮转掉的 4 份旧快照对应的提醒已解开，提醒行保留
+    notifs = client.get("/api/notifications", headers=h).json()
+    assert notifs["unread"] == 24
+    sids = [n["snapshot_id"] for n in notifs["items"]]
+    assert sum(1 for s in sids if s is None) == 4  # 解开的 4 条前端不再渲染按钮
+    with app_module.get_db() as conn:
+        kept = {r["id"] for r in conn.execute(
+            "SELECT id FROM snapshots WHERE watch_id = ?", (w["id"],))}
+    assert all(s in kept for s in sids if s is not None)
+
+
+def test_ssrf_blocks_metadata_host_and_scheme():
+    """TASK-021 P1-1 对账补充：云元数据主机名、非 http(s) 协议直接拦。"""
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://metadata.google.internal/latest/")
+    assert "元数据" in str(exc.value)
+    with pytest.raises(app_module.FetchError):
+        app_module.fetch_url("file:///etc/passwd")
+    with pytest.raises(app_module.FetchError) as exc2:
+        app_module.fetch_url("http://100.100.100.200/latest/meta-data/")
+    assert "内网" in str(exc2.value)
+
+
 # ------------------------------------------------------------------ 真抓取（本地服务）
 
 
