@@ -235,7 +235,7 @@ async function loadNotifs(){
       </div>`).join('') : '<div class="empty">还没有提醒。</div>');
 }
 function toggleNotifs(){ notifOpen=!notifOpen; document.getElementById('notifPanel').style.display=notifOpen?'block':'none'; if(notifOpen) loadNotifs(); }
-async function readOne(id){ await api(`/api/notifications/${id}/read`,{method:'POST'}); await loadNotifs(); }
+async function readOne(id){ await api(`/api/notifications/${id}/read`,{method:'POST'}); await loadNotifs(); await loadWatches(); }
 async function readAll(){ await api('/api/notifications/read-all',{method:'POST'}); await loadNotifs(); await loadWatches(); }
 async function gotoSnap(wid, sid){ if(sid==null){ toast('这份快照已超出保留上限'); return; } notifOpen=false; document.getElementById('notifPanel').style.display='none'; selectedId=wid; selectedSnapId=sid; await loadWatches(); await loadDetail(wid); const w=watches.find(x=>x.id===wid); if(w&&w.has_unread_change){ await api(`/api/watches/${wid}/seen`,{method:'POST'}); await loadWatches(); await loadNotifs(); } }
 

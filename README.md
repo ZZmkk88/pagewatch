@@ -43,7 +43,7 @@ python app.py
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | 监听地址。默认只监听本机；确实需要局域网/对外访问时才改 `0.0.0.0`，**放开前务必先改掉默认密码** |
 | `PORT` | `8000` | 监听端口 |
-| `PAGEWATCH_DB_PATH` | `data/pagewatch.db` | 数据库文件位置 |
+| `PAGEWATCH_DB_PATH` | `<app.py 所在目录>/data/pagewatch.db` | 数据库文件位置（相对 app.py 所在目录，不跟随进程当前目录） |
 | `PAGEWATCH_ALLOW_PRIVATE_FETCH` | 关 | 设为 `1` 时关闭抓取的内网地址拦截。仅供本地调试/自测（监测对象就在本机时），正式环境不要开启 |
 | `PAGEWATCH_DISABLE_SCHEDULER` | 关 | 设为 `1` 时不启动进程内定时调度（测试用） |
 
@@ -59,7 +59,7 @@ python tests/live_selftest.py
 
 （Windows 同样是这两条命令，在已激活 venv 的 PowerShell 里执行。）
 
-实测结果（2026-10-21，云端 2 核环境）：自动化测试 20 项全过；
+实测结果（2026-10-21，云端 2 核环境）：自动化测试 30 项全过；
 `live_selftest.py` 会真的起一个服务进程加一个本地假页面，走一遍
 "登录 → 建监测项 → 检查得首份快照 → 改假页面内容 → 再检查报变化 →
 看 diff 改动行 → 提醒生成 → 标已读"的完整流程，20 个检查点全过。
@@ -70,13 +70,16 @@ python tests/live_selftest.py
 - `static/index.html` — 单页前端（原生 HTML/JS，无构建步骤）
 - `tests/test_app.py` — 自动化测试
 - `tests/live_selftest.py` — 真实服务自测脚本
+- `requirements.txt` — 运行依赖（版本钉死）
+- `requirements-dev.txt` — 开发/测试依赖（版本钉死）
+- `LICENSE` — 许可证全文（Apache-2.0）
 - `NOTES.md` — 设计调研笔记
 - `UPSTREAM.md` — 上游溯源信息
 - `DECISIONS.md` — 本仓的决定记录（口径落实与审查处理）
 
 ## 说明
 
-- **只抓静态 HTML**：纯靠前端 JavaScript 渲染出正文的页面抓不到内容，本项目不支持浏览器渲染抓取，选监测对象时请避开这类页面。
-- 抓取带 SSRF 防护：目标主机名解析出的任一地址命中内网/保留网段即拒绝抓取，重定向每一跳重新校验；接口文档页（/docs 等）默认关闭。
+- **只抓静态 HTML**：纯靠前端 JavaScript 渲染出正文的页面抓不到内容，本项目不支持浏览器渲染抓取，选监测对象时请避开这类页面。响应没有 `Content-Type`、或主类型不是 `text/html` 的一律拒绝。
+- 抓取带 SSRF 防护：目标主机名解析出的任一地址命中内网/保留网段即拒绝抓取；连接只打向校验过的 IP（IP 钉住，防 DNS rebind），重定向最多跟 10 跳、每一跳重新校验；接口文档页（/docs 等）默认关闭。
 - 只做站内提醒，不发邮件 / Telegram 等外部通知。
 - 本项目为个人自托管用途的单用户版本，不含多用户、内容筛选器、价格监控等功能。

@@ -58,3 +58,27 @@
     P2 其余 11 条本轮未动。
   - 红线核对：分支测试文件与基座（5ecbb22f）逐字节一致，未被动过；
     新 main 上重跑 pytest 23 项＋真实自测 20 检查点全部通过。
+- **TASK-034（Grok 深度审查 P1-1 增量硬化，基座旧 3 commit）**：未直接合并，
+  在当前 main 上正经实现。抓取改用 `http.client` 直连＋IP 钉住：
+  `_checked_ips` 返回校验过的 IP 列表（解析失败/无法识别/无可用地址一律
+  拒绝，不再静默放行）；`_PinnedHTTPConnection` / `_PinnedHTTPSConnection`
+  只连接刚刚校验过的 IP（Host 头与 HTTPS SNI 仍用原主机名，防 DNS rebind）；
+  不再走 urllib（避开 HTTP_PROXY 环境代理、避开连接时二次解析）；
+  重定向手动跟、最多 10 跳、每一跳重新解析校验；协议白名单与
+  PAGEWATCH_ALLOW_PRIVATE_FETCH 调试开关保留；198.18 排除保留
+  （与总表第 9 条一致）。配 4 个回归测试（rebind 探针、重定向逐跳校验、
+  10 跳上限、不可识别解析结果拒绝）。P1-2（logout）与 main 已有实现
+  （0c5d4d0）重复，不合。
+- **TASK-049（Grok P2 收口轮，基座旧）**：未直接合并，手工搬运
+  P2-1/2/3/4/6，跳过 P2-5（与 0c5d4d0 的快照轮转解提醒同义重复）：
+  P2-1 页面超 2MB 抛错不存快照（恰好等于上限仍成功）；
+  P2-2 README 数据库路径改为 `<app.py 所在目录>/data/pagewatch.db`
+  并注明不跟随进程当前目录；
+  P2-3 非 text/html 响应拒绝（无 Content-Type 或主类型不对都拦，
+  与 README「只抓静态 HTML」对齐）；
+  P2-4 单条标已读后该监测项无未读则清 has_unread_change（前端 readOne
+  补 loadWatches 刷新列表）；
+  P2-6 README 项目结构补 requirements.txt / requirements-dev.txt /
+  LICENSE。配 3 个回归测试。P2-7/P2-8 按报告结论不改。
+  - 红线核对：两分支测试文件均未被动过；新 main 上 pytest 30 项＋
+    真实自测 20 检查点全部通过。
