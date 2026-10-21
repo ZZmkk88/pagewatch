@@ -34,3 +34,27 @@
   P1-1 数据库连接改为 `_ClosingConn` 包装（with 结束提交/回滚后关闭连接）；
   P1-2 改密吊销其他会话（见上）。P2 的 11 条本轮未动，其中"未改密前能调
   业务接口"一条与总表第 1 条口径相关，按已定决策保持现状。
+- **TASK-021（Grok 第二轮审查，P0 0 / P1 4 / P2 13）**：基座比当前 main
+  旧 4 个 commit，未直接合并，逐条手工搬运对账后合入 main：
+  - P1-1（重定向 SSRF）与我方已有修法（3f7e1308）对账：Grok 方案初始目标
+    放行用户手写的环回/私网、重定向守卫用 `not is_global`（即 is_private
+    一刀切的变体），两处都与总表第 9 条冲突（且在云端假 IP 环境下会误拦
+    公网重定向），故整体不采纳。只采纳其互补项：`_assert_url_allowed` 新增
+    http/https 协议白名单、云元数据主机名显式拦截
+    （metadata.google.internal / metadata.google.com）、`_BLOCKED_NETWORKS`
+    追加 100.100.100.200/32（阿里云元数据）。配回归测试
+    `test_ssrf_blocks_metadata_host_and_scheme`。
+  - P1-2（改密删全部 token 含本次）与总表第 2 条冲突（保留本次会话），
+    且我方 main 的实现（d9841ec2）已符合口径：不合入，关闭。
+  - P1-3（新增 POST /api/logout 只废止当前会话）为新增真功能，采纳；
+    前端 logout 先调接口再清本地（直接 fetch，避免 401 递归）。配回归测试
+    `test_logout_revokes_only_current_session`。
+  - P1-4（快照轮转后提醒悬空）为新增真修，采纳：删旧快照前把对应提醒
+    snapshot_id 置 NULL（提醒行保留、未读数不变），前端条件渲染按钮并在
+    sid 为空时提示。配回归测试
+    `test_snapshot_rotation_unlinks_notifications`。
+  - P2-8（强制改密）与总表第 1 条一致，Grok 本人也明确"不改"：永久不采纳，
+    再报直接关闭。P2-11（/docs 无登录）已在总表第 6 条落实，无需动作。
+    P2 其余 11 条本轮未动。
+  - 红线核对：分支测试文件与基座（5ecbb22f）逐字节一致，未被动过；
+    新 main 上重跑 pytest 23 项＋真实自测 20 检查点全部通过。
