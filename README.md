@@ -43,7 +43,7 @@ python app.py
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | 监听地址。默认只监听本机；确实需要局域网/对外访问时才改 `0.0.0.0`，**放开前务必先改掉默认密码** |
 | `PORT` | `8000` | 监听端口 |
-| `PAGEWATCH_DB_PATH` | `data/pagewatch.db` | 数据库文件位置 |
+| `PAGEWATCH_DB_PATH` | `<app.py 所在目录>/data/pagewatch.db` | 未设置时用 `app.py` 所在目录下的 `data/pagewatch.db`，不跟随进程当前目录 |
 | `PAGEWATCH_ALLOW_PRIVATE_FETCH` | 关 | 设为 `1` 时关闭抓取的内网地址拦截。仅供本地调试/自测（监测对象就在本机时），正式环境不要开启 |
 | `PAGEWATCH_DISABLE_SCHEDULER` | 关 | 设为 `1` 时不启动进程内定时调度（测试用） |
 
@@ -73,10 +73,13 @@ python tests/live_selftest.py
 - `NOTES.md` — 设计调研笔记
 - `UPSTREAM.md` — 上游溯源信息
 - `DECISIONS.md` — 本仓的决定记录（口径落实与审查处理）
+- `requirements.txt` — 运行依赖
+- `requirements-dev.txt` — 开发依赖（含运行依赖）
+- `LICENSE` — Apache License 2.0 文本
 
 ## 说明
 
-- **只抓静态 HTML**：纯靠前端 JavaScript 渲染出正文的页面抓不到内容，本项目不支持浏览器渲染抓取，选监测对象时请避开这类页面。
+- **只抓静态 HTML**：纯靠前端 JavaScript 渲染出正文的页面抓不到内容，本项目不支持浏览器渲染抓取，选监测对象时请避开这类页面。响应没有 `Content-Type`，或主类型不是 `text/html`，记为抓取错误，不存快照。
 - 抓取带 SSRF 防护：目标主机名解析出的任一地址命中内网/保留网段即拒绝抓取，重定向每一跳重新校验；接口文档页（/docs 等）默认关闭。
 - 只做站内提醒，不发邮件 / Telegram 等外部通知。
 - 本项目为个人自托管用途的单用户版本，不含多用户、内容筛选器、价格监控等功能。

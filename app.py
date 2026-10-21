@@ -296,14 +296,22 @@ def fetch_url(url: str, timeout: int = FETCH_TIMEOUT,
                     break
                 chunks.append(chunk)
                 read += len(chunk)
+            if read > max_bytes:
+                raise FetchError(f"页面超过体积上限（{max_bytes} 字节）")
             raw = b"".join(chunks)
             charset = resp.headers.get_content_charset() or "utf-8"
+            content_type = resp.headers.get("Content-Type")
     except HTTPError as e:
         raise FetchError(f"HTTP {e.code}") from e
     except (URLError, TimeoutError, OSError) as e:
         raise FetchError(f"抓取失败：{e}") from e
     if status >= 400:
         raise FetchError(f"HTTP {status}")
+    if content_type is None or not str(content_type).strip():
+        raise FetchError("响应没有 Content-Type")
+    media_type = str(content_type).split(";", 1)[0].strip().lower()
+    if media_type != "text/html":
+        raise FetchError(f"不是 HTML 页面（Content-Type: {media_type}）")
     try:
         return status, raw.decode(charset, errors="replace")
     except (LookupError, UnicodeDecodeError):
@@ -373,7 +381,15 @@ def run_check(watch_id: int, fetcher=None) -> dict:
             (watch_id, now, digest, text, is_change),
         )
         snapshot_id = cur.lastrowid
-        # 只保留最近 SNAPSHOT_KEEP 份
+        # 只保留最近 SNAPSHOT_KEEP 份。先把将被删掉的快照从提醒上摘掉，
+        # 提醒本身保留（未读计数不能因此变少）。
+        conn.execute(
+            "UPDATE notifications SET snapshot_id = NULL"
+            " WHERE watch_id = ? AND snapshot_id NOT IN"
+            " (SELECT id FROM snapshots WHERE watch_id = ?"
+            "  ORDER BY id DESC LIMIT ?)",
+            (watch_id, watch_id, SNAPSHOT_KEEP),
+        )
         conn.execute(
             "DELETE FROM snapshots WHERE watch_id = ? AND id NOT IN"
             " (SELECT id FROM snapshots WHERE watch_id = ?"
@@ -747,12 +763,26 @@ def list_notifications(user: sqlite3.Row = Depends(current_user)):
 def read_notification(notification_id: int,
                       user: sqlite3.Row = Depends(current_user)):
     with get_db() as conn:
-        cur = conn.execute(
+        row = conn.execute(
+            "SELECT watch_id FROM notifications WHERE id = ?",
+            (notification_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="提醒不存在")
+        conn.execute(
             "UPDATE notifications SET is_read = 1 WHERE id = ?",
             (notification_id,),
         )
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="提醒不存在")
+        left = conn.execute(
+            "SELECT COUNT(*) AS n FROM notifications"
+            " WHERE watch_id = ? AND is_read = 0",
+            (row["watch_id"],),
+        ).fetchone()["n"]
+        if left == 0:
+            conn.execute(
+                "UPDATE watches SET has_unread_change = 0 WHERE id = ?",
+                (row["watch_id"],),
+            )
     return {"ok": True}
 
 
