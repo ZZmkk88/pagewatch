@@ -77,6 +77,8 @@ def main():
     base = f"http://127.0.0.1:{app_port}"
     env = dict(os.environ)
     env["PAGEWATCH_DB_PATH"] = os.path.join(TMP, "live.db")
+    # 假页面在本机 127.0.0.1 上，按口径第 9 条显式打开本地抓取开关（仅自测）
+    env["PAGEWATCH_ALLOW_PRIVATE_FETCH"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app:app",
          "--host", "127.0.0.1", "--port", str(app_port)],

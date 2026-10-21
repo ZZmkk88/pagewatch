@@ -337,10 +337,78 @@ def test_read_all_notifications(monkeypatch):
     assert watch["has_unread_change"] is False
 
 
+# ------------------------------------------------------------------ 口径回归
+
+
+def test_change_password_revokes_other_sessions():
+    """口径总表第 2 条：改密后吊销其他会话，保留当前会话。"""
+    h1 = login()
+    h2 = login()
+    assert client.get("/api/me", headers=h2).status_code == 200
+    r = client.post(
+        "/api/change-password",
+        json={"old_password": "admin123", "new_password": "newpass1"},
+        headers=h1,
+    )
+    assert r.status_code == 200
+    assert client.get("/api/me", headers=h1).status_code == 200  # 当前会话保留
+    assert client.get("/api/me", headers=h2).status_code == 401  # 其他会话已吊销
+
+
+def test_docs_pages_closed():
+    """口径总表第 6 条：接口文档页默认关闭，未登录不得访问。"""
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_ssrf_blocks_private_targets():
+    """口径总表第 9 条：抓取前拦截内网目标（默认不放开本地开关时）。"""
+    with pytest.raises(app_module.FetchError) as exc:
+        app_module.fetch_url("http://127.0.0.1:9/secret")
+    assert "内网" in str(exc.value)
+    with pytest.raises(app_module.FetchError):
+        app_module.fetch_url("http://169.254.169.254/latest/meta-data/")
+
+
+def test_check_watch_to_private_url_is_error(monkeypatch):
+    monkeypatch.delenv("PAGEWATCH_ALLOW_PRIVATE_FETCH", raising=False)
+    h = login()
+    w = make_watch(h, url="http://127.0.0.1:9/secret")
+    r = client.post(f"/api/watches/{w['id']}/check", headers=h)
+    assert r.json()["status"] == "error"
+    assert "内网" in r.json()["error"]
+    watch = client.get("/api/watches", headers=h).json()[0]
+    assert watch["last_status"] == "error"
+    assert client.get(f"/api/watches/{w['id']}/snapshots", headers=h).json() == []
+
+
+def test_overlong_input_rejected_with_lengths():
+    """口径总表第 10 条：超长输入 400 拒绝，报错带上限与当前长度，不截断。"""
+    h = login()
+    r = client.post(
+        "/api/watches",
+        json={"name": "名" * 101, "url": "http://a.b", "interval_minutes": 10},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "100" in r.json()["detail"] and "101" in r.json()["detail"]
+    r = client.post(
+        "/api/watches",
+        json={"name": "x", "url": "http://a.b/" + "p" * 2000,
+              "interval_minutes": 10},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "2000" in r.json()["detail"]
+
+
 # ------------------------------------------------------------------ 真抓取（本地服务）
 
 
-def test_fetch_url_against_local_server():
+def test_fetch_url_against_local_server(monkeypatch):
+    # 本地假服务在 127.0.0.1 上，按口径第 9 条需显式打开本地抓取开关
+    monkeypatch.setenv("PAGEWATCH_ALLOW_PRIVATE_FETCH", "1")
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/ok":
